@@ -14,8 +14,8 @@ func TestStaticCredentials(t *testing.T) {
 		t.Fatalf("expect valid")
 	}
 
-	if !creds.Valid("baz", "") {
-		t.Fatalf("expect valid")
+	if creds.Valid("baz", "") {
+		t.Fatalf("empty credentials must be rejected")
 	}
 
 	if creds.Valid("foo", "") {

@@ -43,7 +43,7 @@ func (a NoAuthAuthenticator) GetCode() uint8 {
 }
 
 func (a NoAuthAuthenticator) Authenticate(reader io.Reader, writer io.Writer) (*AuthContext, error) {
-	_, err := writer.Write([]byte{socks5Version, NoAuth})
+	err := writeFull(writer, []byte{socks5Version, NoAuth})
 	return &AuthContext{NoAuth, nil}, err
 }
 
@@ -59,13 +59,13 @@ func (a UserPassAuthenticator) GetCode() uint8 {
 
 func (a UserPassAuthenticator) Authenticate(reader io.Reader, writer io.Writer) (*AuthContext, error) {
 	// Tell the client to use user/pass auth
-	if _, err := writer.Write([]byte{socks5Version, UserPassAuth}); err != nil {
+	if err := writeFull(writer, []byte{socks5Version, UserPassAuth}); err != nil {
 		return nil, err
 	}
 
 	// Get the version and username length
 	header := []byte{0, 0}
-	if _, err := io.ReadAtLeast(reader, header, 2); err != nil {
+	if _, err := io.ReadFull(reader, header); err != nil {
 		return nil, err
 	}
 
@@ -76,30 +76,38 @@ func (a UserPassAuthenticator) Authenticate(reader io.Reader, writer io.Writer) 
 
 	// Get the user name
 	userLen := int(header[1])
+	if userLen == 0 {
+		_ = writeFull(writer, []byte{userAuthVersion, authFailure})
+		return nil, UserAuthFailed
+	}
 	user := make([]byte, userLen)
-	if _, err := io.ReadAtLeast(reader, user, userLen); err != nil {
+	if _, err := io.ReadFull(reader, user); err != nil {
 		return nil, err
 	}
 
 	// Get the password length
-	if _, err := reader.Read(header[:1]); err != nil {
+	if _, err := io.ReadFull(reader, header[:1]); err != nil {
 		return nil, err
 	}
 
 	// Get the password
 	passLen := int(header[0])
+	if passLen == 0 {
+		_ = writeFull(writer, []byte{userAuthVersion, authFailure})
+		return nil, UserAuthFailed
+	}
 	pass := make([]byte, passLen)
-	if _, err := io.ReadAtLeast(reader, pass, passLen); err != nil {
+	if _, err := io.ReadFull(reader, pass); err != nil {
 		return nil, err
 	}
 
 	// Verify the password
-	if a.Credentials.Valid(string(user), string(pass)) {
-		if _, err := writer.Write([]byte{userAuthVersion, authSuccess}); err != nil {
+	if a.Credentials != nil && a.Credentials.Valid(string(user), string(pass)) {
+		if err := writeFull(writer, []byte{userAuthVersion, authSuccess}); err != nil {
 			return nil, err
 		}
 	} else {
-		if _, err := writer.Write([]byte{userAuthVersion, authFailure}); err != nil {
+		if err := writeFull(writer, []byte{userAuthVersion, authFailure}); err != nil {
 			return nil, err
 		}
 		return nil, UserAuthFailed
@@ -118,11 +126,13 @@ func (s *Server) authenticate(conn io.Writer, bufConn io.Reader) (*AuthContext, 
 		return nil, fmt.Errorf("Failed to get auth methods: %v", err)
 	}
 
-	// Select a usable method
-	for _, method := range methods {
-		cator, found := s.authMethods[method]
-		if found {
-			return cator.Authenticate(bufConn, conn)
+	// Select according to server preference so clients cannot force a weaker
+	// method by listing it first.
+	for _, preferred := range s.authOrder {
+		for _, offered := range methods {
+			if preferred == offered {
+				return s.authMethods[preferred].Authenticate(bufConn, conn)
+			}
 		}
 	}
 
@@ -133,7 +143,9 @@ func (s *Server) authenticate(conn io.Writer, bufConn io.Reader) (*AuthContext, 
 // noAcceptableAuth is used to handle when we have no eligible
 // authentication mechanism
 func noAcceptableAuth(conn io.Writer) error {
-	conn.Write([]byte{socks5Version, noAcceptable})
+	if err := writeFull(conn, []byte{socks5Version, noAcceptable}); err != nil {
+		return fmt.Errorf("%w: %v", NoSupportedAuth, err)
+	}
 	return NoSupportedAuth
 }
 
@@ -141,13 +153,16 @@ func noAcceptableAuth(conn io.Writer) error {
 // and proceeding auth methods
 func readMethods(r io.Reader) ([]byte, error) {
 	header := []byte{0}
-	if _, err := r.Read(header); err != nil {
+	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
 
 	numMethods := int(header[0])
+	if numMethods == 0 {
+		return nil, fmt.Errorf("no authentication methods offered")
+	}
 
 	methods := make([]byte, numMethods)
-	_, err := io.ReadAtLeast(r, methods, numMethods)
+	_, err := io.ReadFull(r, methods)
 	return methods, err
 }

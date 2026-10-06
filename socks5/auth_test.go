@@ -10,7 +10,7 @@ func TestNoAuth(t *testing.T) {
 	req.Write([]byte{1, NoAuth})
 	var resp bytes.Buffer
 
-	s, _ := New(&Config{})
+	s, _ := New(&Config{AllowNoAuth: true})
 	ctx, err := s.authenticate(&resp, req)
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -115,5 +115,14 @@ func TestNoSupportedAuth(t *testing.T) {
 	out := resp.Bytes()
 	if !bytes.Equal(out, []byte{socks5Version, noAcceptable}) {
 		t.Fatalf("bad: %v", out)
+	}
+}
+
+func TestUserPassAuthWithNilCredentialsFailsWithoutPanic(t *testing.T) {
+	req := bytes.NewBuffer([]byte{1, 3, 'f', 'o', 'o', 3, 'b', 'a', 'r'})
+	var resp bytes.Buffer
+	cator := UserPassAuthenticator{}
+	if _, err := cator.Authenticate(req, &resp); err != UserAuthFailed {
+		t.Fatalf("expected authentication failure, got %v", err)
 	}
 }

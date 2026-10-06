@@ -1,9 +1,9 @@
 package socks5
 
 import (
+	"context"
+	"fmt"
 	"net"
-
-	"golang.org/x/net/context"
 )
 
 // NameResolver is used to implement custom name resolution
@@ -15,9 +15,12 @@ type NameResolver interface {
 type DNSResolver struct{}
 
 func (d DNSResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	addr, err := net.ResolveIPAddr("ip", name)
+	addrs, err := net.DefaultResolver.LookupIP(ctx, "ip", name)
 	if err != nil {
 		return ctx, nil, err
 	}
-	return ctx, addr.IP, err
+	if len(addrs) == 0 {
+		return ctx, nil, fmt.Errorf("no addresses found for %q", name)
+	}
+	return ctx, addrs[0], nil
 }

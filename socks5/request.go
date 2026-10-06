@@ -1,13 +1,15 @@
 package socks5
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
-
-	"golang.org/x/net/context"
+	"sync"
+	"time"
 )
 
 const (
@@ -90,13 +92,16 @@ type conn interface {
 func NewRequest(bufConn io.Reader) (*Request, error) {
 	// Read the version byte
 	header := []byte{0, 0, 0}
-	if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
+	if _, err := io.ReadFull(bufConn, header); err != nil {
 		return nil, fmt.Errorf("Failed to get command version: %v", err)
 	}
 
 	// Ensure we are compatible
 	if header[0] != socks5Version {
 		return nil, fmt.Errorf("Unsupported command version: %v", header[0])
+	}
+	if header[2] != 0 {
+		return nil, fmt.Errorf("Invalid reserved byte: %v", header[2])
 	}
 
 	// Read in the destination address
@@ -118,6 +123,14 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 // handleRequest is used for request processing after authentication
 func (s *Server) handleRequest(req *Request, conn conn) error {
 	ctx := context.Background()
+	if s.lifecycle != nil {
+		ctx = s.lifecycle
+	}
+	var cancel context.CancelFunc
+	if s.config.DialTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, s.config.DialTimeout)
+		defer cancel()
+	}
 
 	// Resolve the address if we have a FQDN
 	dest := req.DestAddr
@@ -130,6 +143,9 @@ func (s *Server) handleRequest(req *Request, conn conn) error {
 			return fmt.Errorf("Failed to resolve destination '%v': %v", dest.FQDN, err)
 		}
 		ctx = ctx_
+		if ctx == nil {
+			ctx = context.Background()
+		}
 		dest.IP = addr
 	}
 
@@ -137,6 +153,27 @@ func (s *Server) handleRequest(req *Request, conn conn) error {
 	req.realDestAddr = req.DestAddr
 	if s.config.Rewriter != nil {
 		ctx, req.realDestAddr = s.config.Rewriter.Rewrite(ctx, req)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if req.realDestAddr == nil {
+		if err := sendReply(conn, ruleFailure, nil); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
+		}
+		return fmt.Errorf("rewriter returned nil destination")
+	}
+	if s.config.DenyPrivateIPs && isPrivateIP(req.realDestAddr.IP) {
+		if err := sendReply(conn, ruleFailure, nil); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
+		}
+		return fmt.Errorf("private destination %v blocked by rules", req.realDestAddr)
+	}
+	if req.realDestAddr.FQDN == "" && req.realDestAddr.IP == nil {
+		if err := sendReply(conn, ruleFailure, nil); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
+		}
+		return fmt.Errorf("empty destination")
 	}
 
 	// Switch on the command
@@ -164,17 +201,29 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 		}
 		return fmt.Errorf("Connect to %v blocked by rules", req.DestAddr)
 	} else {
+		if ctx_ == nil {
+			ctx_ = context.Background()
+		}
 		ctx = ctx_
+	}
+	if s.config.DialTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.config.DialTimeout)
+		defer cancel()
 	}
 
 	// Attempt to connect
 	dial := s.config.Dial
 	if dial == nil {
+		dialer := net.Dialer{Timeout: s.config.DialTimeout}
 		dial = func(ctx context.Context, net_, addr string) (net.Conn, error) {
-			return net.Dial(net_, addr)
+			return dialer.DialContext(ctx, net_, addr)
 		}
 	}
 	target, err := dial(ctx, "tcp", req.realDestAddr.Address())
+	if err == nil && target == nil {
+		err = errors.New("dial returned a nil connection")
+	}
 	if err != nil {
 		msg := err.Error()
 		resp := hostUnreachable
@@ -191,26 +240,55 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	defer target.Close()
 
 	// Send success
-	local := target.LocalAddr().(*net.TCPAddr)
-	bind := AddrSpec{IP: local.IP, Port: local.Port}
+	bind := AddrSpec{}
+	if local, ok := target.LocalAddr().(*net.TCPAddr); ok {
+		bind = AddrSpec{IP: local.IP, Port: local.Port}
+	}
 	if err := sendReply(conn, successReply, &bind); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
 
 	// Start proxying
 	errCh := make(chan error, 2)
-	go proxy(target, req.bufConn, errCh)
-	go proxy(conn, target, errCh)
+	var deadlineMu sync.Mutex
+	touch := func() {
+		if s.config.IdleTimeout <= 0 {
+			return
+		}
+		deadline := time.Now().Add(s.config.IdleTimeout)
+		deadlineMu.Lock()
+		_ = target.SetDeadline(deadline)
+		if deadlineConn, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = deadlineConn.SetDeadline(deadline)
+		}
+		deadlineMu.Unlock()
+	}
+	touch()
+	go proxy(target, req.bufConn, errCh, touch)
+	go proxy(conn, target, errCh, touch)
 
 	// Wait
+	var firstErr error
 	for i := 0; i < 2; i++ {
 		e := <-errCh
 		if e != nil {
-			// return from this function closes target (and conn).
-			return e
+			if firstErr == nil && !isClosedError(e) {
+				firstErr = e
+			}
+			_ = target.Close()
+			if closer, ok := conn.(io.Closer); ok {
+				_ = closer.Close()
+			}
 		}
 	}
-	return nil
+	return firstErr
+}
+
+func isClosedError(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
 // handleBind is used to handle a connect command
@@ -258,7 +336,7 @@ func readAddrSpec(r io.Reader) (*AddrSpec, error) {
 
 	// Get the address type
 	addrType := []byte{0}
-	if _, err := r.Read(addrType); err != nil {
+	if _, err := io.ReadFull(r, addrType); err != nil {
 		return nil, err
 	}
 
@@ -266,25 +344,28 @@ func readAddrSpec(r io.Reader) (*AddrSpec, error) {
 	switch addrType[0] {
 	case ipv4Address:
 		addr := make([]byte, 4)
-		if _, err := io.ReadAtLeast(r, addr, len(addr)); err != nil {
+		if _, err := io.ReadFull(r, addr); err != nil {
 			return nil, err
 		}
 		d.IP = net.IP(addr)
 
 	case ipv6Address:
 		addr := make([]byte, 16)
-		if _, err := io.ReadAtLeast(r, addr, len(addr)); err != nil {
+		if _, err := io.ReadFull(r, addr); err != nil {
 			return nil, err
 		}
 		d.IP = net.IP(addr)
 
 	case fqdnAddress:
-		if _, err := r.Read(addrType); err != nil {
+		if _, err := io.ReadFull(r, addrType); err != nil {
 			return nil, err
 		}
 		addrLen := int(addrType[0])
+		if addrLen == 0 {
+			return nil, fmt.Errorf("empty hostname")
+		}
 		fqdn := make([]byte, addrLen)
-		if _, err := io.ReadAtLeast(r, fqdn, addrLen); err != nil {
+		if _, err := io.ReadFull(r, fqdn); err != nil {
 			return nil, err
 		}
 		d.FQDN = string(fqdn)
@@ -295,12 +376,44 @@ func readAddrSpec(r io.Reader) (*AddrSpec, error) {
 
 	// Read the port
 	port := []byte{0, 0}
-	if _, err := io.ReadAtLeast(r, port, 2); err != nil {
+	if _, err := io.ReadFull(r, port); err != nil {
 		return nil, err
 	}
 	d.Port = (int(port[0]) << 8) | int(port[1])
 
 	return d, nil
+}
+
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
+		ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return true
+	}
+	reserved := []struct {
+		network *net.IPNet
+		name    string
+	}{
+		{network: mustCIDR("100.64.0.0/10"), name: "carrier-grade NAT"},
+		{network: mustCIDR("192.0.0.0/24"), name: "IETF protocol assignments"},
+		{network: mustCIDR("192.0.2.0/24"), name: "documentation"},
+		{network: mustCIDR("198.18.0.0/15"), name: "benchmarking"},
+		{network: mustCIDR("198.51.100.0/24"), name: "documentation"},
+		{network: mustCIDR("203.0.113.0/24"), name: "documentation"},
+	}
+	for _, item := range reserved {
+		if item.network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func mustCIDR(value string) *net.IPNet {
+	_, network, err := net.ParseCIDR(value)
+	if err != nil {
+		panic(err)
+	}
+	return network
 }
 
 // sendReply is used to send a reply message
@@ -316,6 +429,9 @@ func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
 		addrPort = 0
 
 	case addr.FQDN != "":
+		if len(addr.FQDN) > 255 {
+			return fmt.Errorf("hostname is too long")
+		}
 		addrType = fqdnAddress
 		addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
 		addrPort = uint16(addr.Port)
@@ -345,8 +461,23 @@ func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
 	msg[4+len(addrBody)+1] = byte(addrPort & 0xff)
 
 	// Send the message
-	_, err := w.Write(msg)
-	return err
+	return writeFull(w, msg)
+}
+
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 type closeWriter interface {
@@ -355,10 +486,33 @@ type closeWriter interface {
 
 // proxy is used to suffle data from src to destination, and sends errors
 // down a dedicated channel
-func proxy(dst io.Writer, src io.Reader, errCh chan error) {
-	_, err := io.Copy(dst, src)
+func proxy(dst io.Writer, src io.Reader, errCh chan error, touch func()) {
+	buf := proxyBufferPool.Get().([]byte)
+	reader := io.Reader(src)
+	if touch != nil {
+		reader = activityReader{Reader: src, touch: touch}
+	}
+	_, err := io.CopyBuffer(dst, reader, buf)
+	proxyBufferPool.Put(buf)
 	if tcpConn, ok := dst.(closeWriter); ok {
 		tcpConn.CloseWrite()
 	}
 	errCh <- err
 }
+
+type activityReader struct {
+	io.Reader
+	touch func()
+}
+
+func (r activityReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 {
+		r.touch()
+	}
+	return n, err
+}
+
+var proxyBufferPool = sync.Pool{New: func() interface{} {
+	return make([]byte, 32*1024)
+}}
